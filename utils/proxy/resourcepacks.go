@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 
@@ -26,7 +27,9 @@ type resourcePackQueue struct {
 	currentOffset uint64
 
 	serverPackAmount int
-	downloadingPacks map[string]downloadingPack
+	// map[pack uuid]map[pack size]pack
+	// this way servers with multiple packs on the same uuid work
+	downloadingPacks map[string]map[uint64]downloadingPack
 	awaitingPacks    map[string]*downloadingPack
 	NextPack         chan *resource.Pack
 }
@@ -37,7 +40,7 @@ type downloadingPack struct {
 	chunkSize     uint32
 	size          uint64
 	expectedIndex uint32
-	newFrag       chan []byte
+	newFrag       chan *packet.ResourcePackChunkData
 	contentKey    string
 }
 
@@ -66,6 +69,7 @@ type rpHandler struct {
 	addedPacksDone   int
 
 	downloadQueue *resourcePackQueue
+	packDownloads chan *packet.ResourcePackDataInfo
 
 	// closed when decided what packs to download from the server
 	knowPacksRequestedFromServer chan struct{}
@@ -80,11 +84,11 @@ type rpHandler struct {
 
 	// closed when the proxy has received resource pack info from the server
 	receivedRemotePackInfo chan struct{}
-	remotePacks            *packet.ResourcePacksInfo
+	remotePacksInfo        *packet.ResourcePacksInfo
 
 	// closed when the proxy has received the resource pack stack from the server
 	receivedRemoteStack chan struct{}
-	stack               *packet.ResourcePackStack
+	remoteStack         *packet.ResourcePackStack
 
 	// used when adding a resourcepack to the list after its downloaded
 	packMu sync.Mutex
@@ -105,7 +109,7 @@ func newRpHandler(ctx context.Context, addedPacks []*resource.Pack) *rpHandler {
 		log:        logrus.WithField("part", "ResourcePacks"),
 		addedPacks: addedPacks,
 		downloadQueue: &resourcePackQueue{
-			downloadingPacks: make(map[string]downloadingPack),
+			downloadingPacks: make(map[string]map[uint64]downloadingPack),
 			awaitingPacks:    make(map[string]*downloadingPack),
 			NextPack:         make(chan *resource.Pack),
 		},
@@ -140,10 +144,12 @@ func (r *rpHandler) OnResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 	packsToDownload := make([]string, 0, totalPacks)
 
 	for _, pack := range pk.TexturePacks {
+		packID := pack.UUID + "_" + pack.Version
+
 		_, alreadyDownloading := r.downloadQueue.downloadingPacks[pack.UUID]
 		alreadyIgnored := slices.ContainsFunc(r.ignoredResourcePacks, func(e exemptedResourcePack) bool { return e.uuid == pack.UUID })
 		if alreadyDownloading || alreadyIgnored {
-			r.log.Warnf("duplicate texture pack entry %v in resource pack info\n", pack.UUID)
+			r.log.Warnf("duplicate texture pack entry %v in resource pack info", pack.UUID)
 			r.downloadQueue.serverPackAmount--
 			continue
 		}
@@ -159,9 +165,7 @@ func (r *rpHandler) OnResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 			continue
 		}
 
-		idxURL := slices.IndexFunc(pk.PackURLs, func(pu protocol.PackURL) bool {
-			return pack.UUID+"_"+pack.Version == pu.UUIDVersion
-		})
+		idxURL := slices.IndexFunc(pk.PackURLs, func(pu protocol.PackURL) bool { return pu.UUIDVersion == packID })
 		if idxURL != -1 {
 			url := pk.PackURLs[idxURL]
 			r.ignoredResourcePacks = append(r.ignoredResourcePacks, exemptedResourcePack{
@@ -192,22 +196,29 @@ func (r *rpHandler) OnResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 						r.nextPackToClient <- newPack
 					}
 				}
-
 			}()
 			r.downloadQueue.serverPackAmount--
 			continue
 		}
 
 		// This UUID_Version is a hack Mojang put in place.
-		packsToDownload = append(packsToDownload, pack.UUID+"_"+pack.Version)
-		r.downloadQueue.downloadingPacks[pack.UUID] = downloadingPack{
+		packsToDownload = append(packsToDownload, packID)
+
+		m, ok := r.downloadQueue.downloadingPacks[pack.UUID]
+		if !ok {
+			m = make(map[uint64]downloadingPack)
+			r.downloadQueue.downloadingPacks[pack.UUID] = m
+		}
+		m[pack.Size] = downloadingPack{
 			size:       pack.Size,
 			buf:        bytes.NewBuffer(make([]byte, 0, pack.Size)),
-			newFrag:    make(chan []byte),
+			newFrag:    make(chan *packet.ResourcePackChunkData),
 			contentKey: pack.ContentKey,
 		}
 	}
 	for _, pack := range pk.BehaviourPacks {
+		packID := pack.UUID + "_" + pack.Version
+
 		if _, ok := r.downloadQueue.downloadingPacks[pack.UUID]; ok {
 			r.log.Warnf("duplicate behaviour pack entry %v in resource pack info\n", pack.UUID)
 			r.downloadQueue.serverPackAmount--
@@ -225,16 +236,22 @@ func (r *rpHandler) OnResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 			continue
 		}
 		// This UUID_Version is a hack Mojang put in place.
-		packsToDownload = append(packsToDownload, pack.UUID+"_"+pack.Version)
-		r.downloadQueue.downloadingPacks[pack.UUID] = downloadingPack{
+		packsToDownload = append(packsToDownload, packID)
+
+		m, ok := r.downloadQueue.downloadingPacks[pack.UUID]
+		if !ok {
+			m = make(map[uint64]downloadingPack)
+			r.downloadQueue.downloadingPacks[pack.UUID] = m
+		}
+		m[pack.Size] = downloadingPack{
 			size:       pack.Size,
 			buf:        bytes.NewBuffer(make([]byte, 0, pack.Size)),
-			newFrag:    make(chan []byte),
+			newFrag:    make(chan *packet.ResourcePackChunkData),
 			contentKey: pack.ContentKey,
 		}
 	}
 
-	r.remotePacks = pk
+	r.remotePacksInfo = pk
 	close(r.receivedRemotePackInfo)
 	r.log.Debug("received remote pack infos")
 	if r.Client != nil {
@@ -246,6 +263,17 @@ func (r *rpHandler) OnResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 	}
 
 	if len(packsToDownload) != 0 {
+		// start downloading from server whenever a pack info is sent
+		r.packDownloads = make(chan *packet.ResourcePackDataInfo, len(packsToDownload))
+		go func() {
+			for pk := range r.packDownloads {
+				err := r.downloadResourcePack(pk)
+				if err != nil {
+					r.log.Error(err)
+				}
+			}
+		}()
+
 		r.Server.Expect(packet.IDResourcePackDataInfo, packet.IDResourcePackChunkData)
 		_ = r.Server.WritePacket(&packet.ResourcePackClientResponse{
 			Response:        packet.PackResponseSendPacks,
@@ -259,29 +287,40 @@ func (r *rpHandler) OnResourcePacksInfo(pk *packet.ResourcePacksInfo) error {
 	return nil
 }
 
-// from server
-func (r *rpHandler) OnResourcePackDataInfo(pk *packet.ResourcePackDataInfo) error {
-	id := strings.Split(pk.UUID, "_")[0]
-
-	pack, ok := r.downloadQueue.downloadingPacks[id]
+func (r *rpHandler) downloadResourcePack(pk *packet.ResourcePackDataInfo) error {
+	packID := strings.Split(pk.UUID, "_")[0]
+	packMap, ok := r.downloadQueue.downloadingPacks[packID]
 	if !ok {
 		// We either already downloaded the pack or we got sent an invalid UUID, that did not match any pack
 		// sent in the ResourcePacksInfo packet.
 		if _, ok := r.cache.(*replayCache); ok {
 			return nil
 		}
-		return fmt.Errorf("unknown pack to download with UUID %v", id)
+		return fmt.Errorf("unknown pack to download with UUID %v", pk.UUID)
 	}
+
+	pack, ok := packMap[pk.Size]
+	if !ok {
+		r.log.Infof("pack %v with size from ResourcePackDataInfo packet doesnt exist", pk.UUID)
+		for _, p := range packMap {
+			pack = p
+			break
+		}
+	}
+
 	if pack.size != pk.Size {
 		// Size mismatch: The ResourcePacksInfo packet had a size for the pack that did not match with the
 		// size sent here.
-		r.log.Infof("pack %v had a different size in the ResourcePacksInfo packet than the ResourcePackDataInfo packet\n", pk.UUID)
+		r.log.Infof("pack %v had a different size in the ResourcePacksInfo packet than the ResourcePackDataInfo packet", pk.UUID)
 		pack.size = pk.Size
 	}
 
 	// Remove the resource pack from the downloading packs and add it to the awaiting packets.
-	delete(r.downloadQueue.downloadingPacks, id)
-	r.downloadQueue.awaitingPacks[id] = &pack
+	delete(packMap, pk.Size)
+	if len(packMap) == 0 {
+		delete(r.downloadQueue.downloadingPacks, pk.UUID)
+	}
+	r.downloadQueue.awaitingPacks[pk.UUID] = &pack
 	pack.chunkSize = pk.DataChunkSize
 
 	// The client calculates the chunk count by itself: You could in theory send a chunk count of 0 even
@@ -292,70 +331,78 @@ func (r *rpHandler) OnResourcePackDataInfo(pk *packet.ResourcePackDataInfo) erro
 	}
 
 	idCopy := pk.UUID
-	go func() {
-		for i := uint32(0); i < chunkCount; i++ {
-			_ = r.Server.WritePacket(&packet.ResourcePackChunkRequest{
-				UUID:       idCopy,
-				ChunkIndex: i,
-			})
-			select {
-			case <-r.Server.OnDisconnect():
-				return
-			case frag := <-pack.newFrag:
-				// Write the fragment to the full buffer of the downloading resource pack.
 
-				lastData := pack.buf.Len()+int(pack.chunkSize) >= int(pack.size)
-				if !lastData && uint32(len(frag)) != pack.chunkSize {
-					// The chunk data didn't have the full size and wasn't the last data to be sent for the resource pack,
-					// meaning we got too little data.
-					r.log.Warnf("resource pack chunk data had a length of %v, but expected %v", len(frag), pack.chunkSize)
-					return
-				}
+	for i := uint32(0); i < chunkCount; i++ {
+		_ = r.Server.WritePacket(&packet.ResourcePackChunkRequest{
+			UUID:       idCopy,
+			ChunkIndex: i,
+		})
+		select {
+		case <-r.Server.OnDisconnect():
+			return net.ErrClosed
+		case frag := <-pack.newFrag:
+			// Write the fragment to the full buffer of the downloading resource pack.
 
-				_, _ = pack.buf.Write(frag)
+			lastData := pack.buf.Len()+int(pack.chunkSize) >= int(pack.size)
+			if !lastData && uint32(len(frag.Data)) != pack.chunkSize {
+				// The chunk data didn't have the full size and wasn't the last data to be sent for the resource pack,
+				// meaning we got too little data.
+				return fmt.Errorf("resource pack chunk data had a length of %v, but expected %v", len(frag.Data), pack.chunkSize)
 			}
-		}
-		close(pack.newFrag)
-		r.packMu.Lock()
-		defer r.packMu.Unlock()
 
-		if pack.buf.Len() != int(pack.size) {
-			r.log.Warnf("incorrect resource pack size: expected %v, but got %v\n", pack.size, pack.buf.Len())
-			return
-		}
-		// First parse the resource pack from the total byte buffer we obtained.
-		newPack, err := resource.Read(pack.buf)
-		newPack = newPack.WithContentKey(pack.contentKey)
-		if err != nil {
-			r.log.Warnf("invalid full resource pack data for UUID %v: %v\n", id, err)
-			return
-		}
-		r.downloadQueue.serverPackAmount--
-		// Finally we add the resource to the resource packs slice.
-		r.resourcePacks = append(r.resourcePacks, newPack)
-		r.OnFinishedPack(newPack)
-		r.cache.Put(newPack)
-
-		// if theres a client and the client needs resource packs send it to its queue
-		if r.nextPackToClient != nil && slices.Contains(r.packsRequestedFromServer, id) {
-			r.log.Debugf("sending pack %s from server to client", id)
-			r.nextPackToClient <- newPack
-		}
-		if r.downloadQueue.serverPackAmount == 0 {
-			if r.nextPackToClient != nil {
-				close(r.nextPackToClient)
+			if frag.DataOffset != uint64(pack.buf.Len()) {
+				return fmt.Errorf("resourcepack current offset %d != %d fragment offset", pack.buf.Len(), frag.DataOffset)
 			}
-			r.Server.Expect(packet.IDResourcePackStack)
-			_ = r.Server.WritePacket(&packet.ResourcePackClientResponse{Response: packet.PackResponseAllPacksDownloaded})
+
+			_, _ = pack.buf.Write(frag.Data)
 		}
-	}()
+	}
+	close(pack.newFrag)
+	r.packMu.Lock()
+	defer r.packMu.Unlock()
+
+	if pack.buf.Len() != int(pack.size) {
+		return fmt.Errorf("incorrect resource pack size: expected %v, but got %v", pack.size, pack.buf.Len())
+	}
+	// First parse the resource pack from the total byte buffer we obtained.
+	newPack, err := resource.Read(pack.buf)
+	if err != nil {
+		return fmt.Errorf("invalid full resource pack data for UUID %v: %v", pk.UUID, err)
+	}
+	newPack = newPack.WithContentKey(pack.contentKey)
+	r.downloadQueue.serverPackAmount--
+	// Finally we add the resource to the resource packs slice.
+	r.resourcePacks = append(r.resourcePacks, newPack)
+	r.OnFinishedPack(newPack)
+	r.cache.Put(newPack)
+
+	// if theres a client and the client needs resource packs send it to its queue
+	if r.nextPackToClient != nil && slices.Contains(r.packsRequestedFromServer, pk.UUID) {
+		r.log.Debugf("sending pack %s from server to client", newPack.Name())
+		r.nextPackToClient <- newPack
+	}
+	if r.downloadQueue.serverPackAmount == 0 {
+		if r.nextPackToClient != nil {
+			close(r.nextPackToClient)
+		}
+		if r.packDownloads != nil {
+			close(r.packDownloads)
+		}
+		r.Server.Expect(packet.IDResourcePackStack)
+		_ = r.Server.WritePacket(&packet.ResourcePackClientResponse{Response: packet.PackResponseAllPacksDownloaded})
+	}
 
 	return nil
 }
 
 // from server
+func (r *rpHandler) OnResourcePackDataInfo(pk *packet.ResourcePackDataInfo) error {
+	r.packDownloads <- pk
+	return nil
+}
+
+// from server
 func (r *rpHandler) OnResourcePackChunkData(pk *packet.ResourcePackChunkData) error {
-	pk.UUID = strings.Split(pk.UUID, "_")[0]
 	pack, ok := r.downloadQueue.awaitingPacks[pk.UUID]
 	if !ok {
 		if _, ok := r.cache.(*replayCache); ok {
@@ -370,7 +417,7 @@ func (r *rpHandler) OnResourcePackChunkData(pk *packet.ResourcePackChunkData) er
 		return fmt.Errorf("resource pack chunk data had chunk index %v, but expected %v", pk.ChunkIndex, pack.expectedIndex)
 	}
 	pack.expectedIndex++
-	pack.newFrag <- pk.Data
+	pack.newFrag <- pk
 	return nil
 }
 
@@ -413,7 +460,7 @@ func (r *rpHandler) OnResourcePackStack(pk *packet.ResourcePackStack) error {
 	}
 	pk.TexturePacks = append(addPacks, pk.TexturePacks...)
 
-	r.stack = pk
+	r.remoteStack = pk
 	close(r.receivedRemoteStack)
 	r.log.Debug("received remote resourcepack stack, starting game")
 
@@ -533,15 +580,16 @@ func (r *rpHandler) Request(packs []string) error {
 
 	for _, packUUID := range packs {
 		uuid_ver := strings.Split(packUUID, "_")
+		id, ver := uuid_ver[0], uuid_ver[1]
 
 		found := false
-		if r.cache.Has(uuid_ver[0], uuid_ver[1]) {
+		if r.cache.Has(id, ver) {
 			r.log.Debug("using", packUUID, "from cache")
 
-			pack := r.cache.Get(uuid_ver[0], uuid_ver[1])
+			pack := r.cache.Get(id, ver)
 
 			// add key
-			for _, pack2 := range r.remotePacks.TexturePacks {
+			for _, pack2 := range r.remotePacksInfo.TexturePacks {
 				if pack2.UUID+"_"+pack2.Version == packUUID {
 					if pack2.ContentKey != "" {
 						pack = pack.WithContentKey(pack2.ContentKey)
@@ -550,7 +598,7 @@ func (r *rpHandler) Request(packs []string) error {
 				}
 			}
 			if pack.ContentKey() == "" {
-				for _, pack2 := range r.remotePacks.BehaviourPacks {
+				for _, pack2 := range r.remotePacksInfo.BehaviourPacks {
 					if pack2.UUID+"_"+pack2.Version == packUUID {
 						if pack2.ContentKey != "" {
 							pack = pack.WithContentKey(pack2.ContentKey)
@@ -575,25 +623,25 @@ func (r *rpHandler) Request(packs []string) error {
 			}
 		}
 
-		found = found || slices.ContainsFunc(r.remotePacks.PackURLs, func(pu protocol.PackURL) bool {
+		found = found || slices.ContainsFunc(r.remotePacksInfo.PackURLs, func(pu protocol.PackURL) bool {
 			return packUUID == pu.UUIDVersion
 		})
 
 		if !found {
-			for _, pack := range r.remotePacks.TexturePacks {
+			for _, pack := range r.remotePacksInfo.TexturePacks {
 				if pack.UUID+"_"+pack.Version == packUUID {
 					found = true
-					r.packsRequestedFromServer = append(r.packsRequestedFromServer, strings.Split(packUUID, "_")[0])
+					r.packsRequestedFromServer = append(r.packsRequestedFromServer, packUUID)
 					break
 				}
 			}
 		}
 
 		if !found {
-			for _, pack := range r.remotePacks.BehaviourPacks {
+			for _, pack := range r.remotePacksInfo.BehaviourPacks {
 				if pack.UUID+"_"+pack.Version == packUUID {
 					found = true
-					r.packsRequestedFromServer = append(r.packsRequestedFromServer, strings.Split(packUUID, "_")[0])
+					r.packsRequestedFromServer = append(r.packsRequestedFromServer, packUUID)
 					break
 				}
 			}
@@ -642,7 +690,7 @@ func (r *rpHandler) OnResourcePackClientResponse(pk *packet.ResourcePackClientRe
 		}
 
 		r.cache.Close()
-		if err := r.Client.WritePacket(r.stack); err != nil {
+		if err := r.Client.WritePacket(r.remoteStack); err != nil {
 			return fmt.Errorf("error writing resource pack stack packet: %v", err)
 		}
 	case packet.PackResponseCompleted:
@@ -660,8 +708,8 @@ func (r *rpHandler) GetResourcePacksInfo(texturePacksRequired bool) *packet.Reso
 	}
 
 	var pk packet.ResourcePacksInfo
-	if r.remotePacks != nil {
-		pk = *r.remotePacks
+	if r.remotePacksInfo != nil {
+		pk = *r.remotePacksInfo
 	}
 
 	// add r.addedPacks to the info
